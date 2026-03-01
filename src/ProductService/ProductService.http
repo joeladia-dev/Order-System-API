@@ -1,0 +1,11 @@
+@BaseUrl = http://localhost:8082
+
+GET {{BaseUrl}}/health
+Accept: application/json
+
+###
+
+GET {{BaseUrl}}/api/products
+Accept: application/json
+
+###

@@ -1,0 +1,11 @@
+@BaseUrl = http://localhost:8083
+
+GET {{BaseUrl}}/health
+Accept: application/json
+
+###
+
+GET {{BaseUrl}}/api/inventory/sku-smoke-1000
+Accept: application/json
+
+###

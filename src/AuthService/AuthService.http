@@ -1,0 +1,36 @@
+@BaseUrl = http://localhost:5260
+@OAuthProvider = google
+@OAuthCode = REPLACE_WITH_AUTH_CODE
+@OAuthState = REPLACE_WITH_STATE
+
+GET {{BaseUrl}}/health
+Accept: application/json
+
+###
+
+POST {{BaseUrl}}/api/auth/request-code
+Content-Type: application/json
+
+{
+  "email": "user@example.com"
+}
+
+###
+
+POST {{BaseUrl}}/api/auth/verify-code
+Content-Type: application/json
+
+{
+  "email": "user@example.com",
+  "code": "000000"
+}
+
+###
+
+GET {{BaseUrl}}/api/auth/oauth/start/{{OAuthProvider}}
+Accept: application/json
+
+###
+
+GET {{BaseUrl}}/api/auth/oauth/callback/{{OAuthProvider}}?code={{OAuthCode}}&state={{OAuthState}}
+Accept: application/json

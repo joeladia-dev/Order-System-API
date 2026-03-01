@@ -1,0 +1,43 @@
+# Environment and local secret files
+.env
+.env.*
+!.env.example
+
+# OAuth downloaded credential artifacts
+client_secret_*.json
+oauth-client-*.json
+
+# Local development data and build artifacts
+**/bin/
+**/obj/
+*.db
+*.db-shm
+*.db-wal
+
+# IDE and user-specific files
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Test and coverage outputs
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local Docker Compose overrides
+docker-compose.override.yml
+docker-compose.*.override.yml

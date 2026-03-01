@@ -1,0 +1,11 @@
+@BaseUrl = http://localhost:8084
+
+GET {{BaseUrl}}/health
+Accept: application/json
+
+###
+
+GET {{BaseUrl}}/api/payments/00000000-0000-0000-0000-000000000000
+Accept: application/json
+
+###
