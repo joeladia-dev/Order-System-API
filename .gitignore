@@ -41,3 +41,6 @@ Desktop.ini
 # Local Docker Compose overrides
 docker-compose.override.yml
 docker-compose.*.override.yml
+
+# Local runtime state files
+.run/

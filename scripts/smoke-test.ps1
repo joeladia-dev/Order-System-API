@@ -207,7 +207,7 @@ $productPayload = @{
 } | ConvertTo-Json
 
 Write-Host "Creating product $productId..."
-$productResponse = Invoke-RestMethod -Uri "$BaseProductUrl/api/products" -Method Post -Headers $productWriteHeaders -ContentType "application/json" -Body $productPayload
+$productResponse = Invoke-RestMethod -Uri "$BaseProductUrl/api/products" -Method Post -Headers $productWriteHeaders -ContentType "application/json" -Body $productPayload -TimeoutSec 20
 
 $orderPayload = @{
     customerId = "cust-smoke"
@@ -222,7 +222,16 @@ $orderPayload = @{
 } | ConvertTo-Json -Depth 5
 
 Write-Host "Creating order..."
-$orderCreated = Invoke-RestMethod -Uri "$BaseOrderUrl/api/orders" -Method Post -Headers $orderHeaders -ContentType "application/json" -Body $orderPayload
+try {
+    $orderCreated = Invoke-RestMethod -Uri "$BaseOrderUrl/api/orders" -Method Post -Headers $orderHeaders -ContentType "application/json" -Body $orderPayload -TimeoutSec 20
+}
+catch {
+    if ($_.Exception.Response) {
+        throw "Order creation failed with HTTP $([int]$_.Exception.Response.StatusCode). Ensure RabbitMQ is running and reachable."
+    }
+
+    throw
+}
 $orderId = [Guid]$orderCreated.orderId
 Write-Host "Order created: $orderId"
 
@@ -244,7 +253,7 @@ if ([int]$afterCreate.status -eq 6) {
         correlationId = [Guid]::NewGuid()
     } | ConvertTo-Json
 
-    $paymentTrigger = Invoke-RestMethod -Uri "$BasePaymentUrl/api/payments/process" -Method Post -ContentType "application/json" -Body $paymentPayload
+    $paymentTrigger = Invoke-RestMethod -Uri "$BasePaymentUrl/api/payments/process" -Method Post -ContentType "application/json" -Body $paymentPayload -TimeoutSec 20
     $finalOrder = Wait-OrderStatus -OrderId $orderId -ExpectedStatuses @(6) -Attempts $PollAttempts -DelayMs $PollDelayMs -OrderUrl $BaseOrderUrl -Headers $orderHeaders
 
     $extendedChainCompleted = ([int]$finalOrder.status -eq 6)

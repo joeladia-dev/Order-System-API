@@ -90,6 +90,51 @@ if (app.Environment.IsDevelopment())
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", service = "AuthService" }));
 
+app.MapGet("/api/auth/session", (HttpContext httpContext) =>
+{
+    if (!httpContext.Request.Cookies.TryGetValue(authOptions.CookieName, out var accessToken) ||
+        string.IsNullOrWhiteSpace(accessToken))
+    {
+        return Results.Unauthorized();
+    }
+
+    var principal = ValidateAccessToken(accessToken, authOptions);
+    if (principal is null)
+    {
+        return Results.Unauthorized();
+    }
+
+    var email = principal.FindFirstValue(JwtRegisteredClaimNames.Email)
+        ?? principal.FindFirstValue(ClaimTypes.Email)
+        ?? string.Empty;
+    var userId = principal.FindFirstValue(JwtRegisteredClaimNames.Sub) ?? string.Empty;
+    var roles = principal.FindAll(ClaimTypes.Role).Select(x => x.Value).ToArray();
+    var scopes = principal.FindFirstValue("scope")?
+        .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        ?? [];
+    var expiresAtUnix = principal.FindFirstValue(JwtRegisteredClaimNames.Exp);
+    DateTimeOffset? expiresAt = null;
+    if (long.TryParse(expiresAtUnix, out var expSeconds))
+    {
+        expiresAt = DateTimeOffset.FromUnixTimeSeconds(expSeconds);
+    }
+
+    return Results.Ok(new
+    {
+        authenticated = true,
+        accessToken,
+        tokenType = "Bearer",
+        expiresAt,
+        user = new
+        {
+            id = userId,
+            email,
+            roles,
+            scopes
+        }
+    });
+});
+
 app.MapPost("/api/auth/request-code", async (RequestCodeRequest request, AuthDbContext db, IWebHostEnvironment env) =>
 {
     var normalizedEmail = NormalizeEmail(request.Email);
@@ -223,6 +268,12 @@ app.MapGet("/api/auth/oauth/start/{provider}", async (string provider, string? r
         return Results.BadRequest(new { message = providerError });
     }
 
+    var normalizedReturnUrl = NormalizeReturnUrl(returnUrl, oauthOptions);
+    if (!string.IsNullOrWhiteSpace(returnUrl) && normalizedReturnUrl is null)
+    {
+        return Results.BadRequest(new { message = "Return URL is not allowed." });
+    }
+
     var now = DateTimeOffset.UtcNow;
     var state = RandomToken(48);
     var expiresAt = now.AddMinutes(oauthOptions.StateExpiryMinutes);
@@ -232,7 +283,7 @@ app.MapGet("/api/auth/oauth/start/{provider}", async (string provider, string? r
         Id = Guid.NewGuid(),
         Provider = providerKey,
         State = state,
-        ReturnUrl = string.IsNullOrWhiteSpace(returnUrl) ? null : returnUrl,
+        ReturnUrl = normalizedReturnUrl,
         CreatedAt = now,
         ExpiresAt = expiresAt,
         ConsumedAt = null
@@ -270,6 +321,7 @@ app.MapGet("/api/auth/oauth/callback/{provider}", async (
     string? state,
     string? error,
     string? error_description,
+    HttpContext httpContext,
     AuthDbContext db,
     IHttpClientFactory httpClientFactory) =>
 {
@@ -408,25 +460,86 @@ app.MapGet("/api/auth/oauth/callback/{provider}", async (
 
     await db.SaveChangesAsync();
 
-    var expiresAt = now.AddMinutes(authOptions.AccessTokenMinutes);
-    var accessToken = CreateAccessToken(user, authOptions, expiresAt);
+    var isAllowlistedAdmin = IsAllowlistedAdmin(normalizedEmail, settings.AdminEmailAllowlist);
+    var roleValues = isAllowlistedAdmin
+        ? (settings.AdminTokenRoles.Count > 0 ? settings.AdminTokenRoles : ["admin"])
+        : (settings.TokenRoles.Count > 0 ? settings.TokenRoles : ["customer"]);
+    var scopeValues = isAllowlistedAdmin
+        ? (settings.AdminTokenScopes.Count > 0 ? settings.AdminTokenScopes : ["orders.read", "orders.write", "catalog.write", "internal"])
+        : (settings.TokenScopes.Count > 0 ? settings.TokenScopes : ["orders.read", "orders.write"]);
 
-    return Results.Ok(new
+    var expiresAt = now.AddMinutes(authOptions.AccessTokenMinutes);
+    var accessToken = CreateAccessToken(user, authOptions, expiresAt, roleValues, scopeValues);
+
+    var redirectUrl = stateRecord.ReturnUrl ?? oauthOptions.DefaultReturnUrl;
+    if (string.IsNullOrWhiteSpace(redirectUrl))
     {
-        accessToken,
-        tokenType = "Bearer",
-        expiresAt,
-        provider = providerKey,
-        user = new
-        {
-            user.Id,
-            user.Email,
-            user.EmailVerified
-        }
+        redirectUrl = "http://localhost:5173/";
+    }
+
+    if (NormalizeReturnUrl(redirectUrl, oauthOptions) is not { } safeRedirectUrl)
+    {
+        return Results.BadRequest(new { message = "Configured OAuth redirect URL is not allowed." });
+    }
+
+    var secureCookie = httpContext.Request.IsHttps || !app.Environment.IsDevelopment();
+    httpContext.Response.Cookies.Append(authOptions.CookieName, accessToken, new CookieOptions
+    {
+        HttpOnly = true,
+        Secure = secureCookie,
+        SameSite = SameSiteMode.Lax,
+        Expires = expiresAt,
+        Path = "/"
     });
+
+    var separator = safeRedirectUrl.Contains('?') ? "&" : "?";
+    var redirectWithStatus = $"{safeRedirectUrl}{separator}oauth=success&provider={Uri.EscapeDataString(providerKey)}";
+
+    return Results.Redirect(redirectWithStatus);
 });
 
 app.Run();
+
+static bool IsAllowlistedAdmin(string normalizedEmail, IReadOnlyCollection<string> allowlist)
+{
+    if (allowlist.Count == 0)
+    {
+        return false;
+    }
+
+    return allowlist
+        .Select(NormalizeEmail)
+        .Any(value => string.Equals(value, normalizedEmail, StringComparison.OrdinalIgnoreCase));
+}
+
+static string? NormalizeReturnUrl(string? returnUrl, OAuthOptions options)
+{
+    if (string.IsNullOrWhiteSpace(returnUrl))
+    {
+        return null;
+    }
+
+    if (!Uri.TryCreate(returnUrl, UriKind.Absolute, out var uri))
+    {
+        return null;
+    }
+
+    if (uri.Scheme is not ("http" or "https"))
+    {
+        return null;
+    }
+
+    if (options.AllowedReturnOrigins.Count == 0)
+    {
+        return uri.ToString();
+    }
+
+    var origin = uri.GetLeftPart(UriPartial.Authority);
+    var isAllowed = options.AllowedReturnOrigins.Any(allowed =>
+        string.Equals(allowed.TrimEnd('/'), origin.TrimEnd('/'), StringComparison.OrdinalIgnoreCase));
+
+    return isAllowed ? uri.ToString() : null;
+}
 
 static string? NormalizeEmail(string? email)
 {
@@ -628,6 +741,32 @@ static string CreateAccessToken(
     return new JwtSecurityTokenHandler().WriteToken(token);
 }
 
+static ClaimsPrincipal? ValidateAccessToken(string accessToken, AuthOptions options)
+{
+    var tokenHandler = new JwtSecurityTokenHandler();
+    var parameters = new TokenValidationParameters
+    {
+        ValidateIssuer = true,
+        ValidateAudience = true,
+        ValidateIssuerSigningKey = true,
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromSeconds(30),
+        ValidIssuer = options.Issuer,
+        ValidAudience = options.Audience,
+        IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(options.SigningKey))
+    };
+
+    try
+    {
+        var principal = tokenHandler.ValidateToken(accessToken, parameters, out _);
+        return principal;
+    }
+    catch
+    {
+        return null;
+    }
+}
+
 sealed class AuthDbContext(DbContextOptions<AuthDbContext> options) : DbContext(options)
 {
     public DbSet<UserEntity> Users => Set<UserEntity>();
@@ -709,6 +848,7 @@ sealed class AuthOptions
 {
     public string Issuer { get; set; } = "OrderSystem.Auth";
     public string Audience { get; set; } = "OrderSystem.Api";
+    public string CookieName { get; set; } = "order_system_auth";
     public string SigningKey { get; set; } = string.Empty;
     public string CodePepper { get; set; } = "dev-otp-pepper";
     public int AccessTokenMinutes { get; set; } = 60;
@@ -720,6 +860,8 @@ sealed class AuthOptions
 sealed class OAuthOptions
 {
     public int StateExpiryMinutes { get; set; } = 10;
+    public string DefaultReturnUrl { get; set; } = "http://localhost:5173/";
+    public List<string> AllowedReturnOrigins { get; set; } = ["http://localhost:5173"];
     public Dictionary<string, OAuthProviderOptions> Providers { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
@@ -736,4 +878,9 @@ sealed class OAuthProviderOptions
     public string Prompt { get; set; } = "select_account";
     public string EmailClaim { get; set; } = "email";
     public string SubjectClaim { get; set; } = "sub";
+    public List<string> TokenRoles { get; set; } = ["customer"];
+    public List<string> TokenScopes { get; set; } = ["orders.read", "orders.write"];
+    public List<string> AdminEmailAllowlist { get; set; } = [];
+    public List<string> AdminTokenRoles { get; set; } = ["admin"];
+    public List<string> AdminTokenScopes { get; set; } = ["orders.read", "orders.write", "catalog.write", "internal"];
 }

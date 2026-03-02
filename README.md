@@ -63,6 +63,21 @@ OpenAPI docs are available per service in Development at:
 
 `/openapi/v1.json`
 
+## Phase 3 helper scripts
+
+From `Order-System-API/scripts`:
+
+- `bootstrap-rabbitmq.ps1` - starts local RabbitMQ (`guest/guest`) if Docker is available.
+- `start-phase3-dev.ps1` - one command launch for RabbitMQ + all APIs + frontend dev server.
+- `start-full-stack.ps1` - one command launch for Docker stack (RabbitMQ + APIs) plus frontend dev server.
+- `stop-full-stack.ps1` - one command stop/cleanup for frontend dev process and Docker stack.
+- `phase3-functional-check.ps1` - health checks + frontend proxy checks + strict smoke test.
+
+From `Order-System-Frontend/scripts`:
+
+- `start-dev-with-api.ps1` - starts full stack by delegating to API `start-full-stack.ps1`.
+- `stop-dev-with-api.ps1` - stops full stack by delegating to API `stop-full-stack.ps1`.
+
 ## Required env var
 
 `Auth:SigningKey` must be present when auth is enabled. In Docker Compose this maps to:
@@ -135,9 +150,14 @@ Minimum pass indicators:
 ### ProductService
 
 - `GET /api/products`
+- `GET /api/products/archived` (admin)
 - `GET /api/products/{id}`
 - `POST /api/products`
+- `PUT /api/products/{id}`
 - `PUT /api/products/{id}/stock`
+- `PUT /api/products/{id}/archive` (admin)
+- `PUT /api/products/{id}/restore` (admin)
+- `DELETE /api/products/{id}` (admin, archived only)
 
 ### InventoryService
 
@@ -160,6 +180,7 @@ Minimum pass indicators:
 - `POST /api/auth/request-code`
 - `POST /api/auth/verify-code`
 - `POST /api/auth/dev/token` (Development only)
+- `GET /api/auth/session`
 - `GET /api/auth/oauth/start/{provider}`
 - `GET /api/auth/oauth/callback/{provider}`
 
@@ -173,12 +194,40 @@ For local Google flow, redirect URI should be:
 
 `http://localhost:8086/api/auth/oauth/callback/google`
 
+OAuth callback behavior:
+
+- The callback does not return `accessToken` JSON.
+- After successful Google sign-in, AuthService sets an HttpOnly auth cookie (`Auth:CookieName`, default `order_system_auth`).
+- The callback redirects the browser to the configured frontend return URL.
+- Frontend can hydrate bearer token by calling `GET /api/auth/session` (cookie-authenticated).
+- Admin role is granted only for emails in `OAuth:Providers:google:AdminEmailAllowlist`; other Google users get customer role.
+
+Cookie/session configuration:
+
+- `Auth:CookieName`
+- `OAuth:DefaultReturnUrl`
+- `OAuth:AllowedReturnOrigins`
+
+Google provider authorization settings:
+
+- `OAuth:Providers:google:TokenRoles`, `TokenScopes` (for non-admin allowlist users)
+- `OAuth:Providers:google:AdminTokenRoles`, `AdminTokenScopes` (for allowlisted admin users)
+
+For local development, use `http://localhost:5173` (not `127.0.0.1`) so cookie-host behavior remains consistent.
+
 Helper scripts in `scripts/`:
 
 - `google-oauth-setup.ps1`
 - `google-oauth-open-browser.ps1`
 - `google-oauth-preflight-open.ps1`
 - `google-oauth-smoke.ps1`
+- `google-oauth-email-smoke.ps1` (legacy alias to `google-oauth-smoke.ps1`)
+
+Recommended local manual flow:
+
+1. Open `http://localhost:5173/customer-sign-in`
+2. Start Google OAuth from the Customer Sign In page
+3. On callback, the app returns to Customer Sign In, restores signed-in status, and hydrates customer bearer token from `/api/auth/session`
 
 ## Running without Docker
 

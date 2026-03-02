@@ -1,4 +1,5 @@
 @BaseUrl = http://localhost:8082
+@AdminToken = replace-with-admin-jwt
 
 GET {{BaseUrl}}/health
 Accept: application/json
@@ -7,5 +8,38 @@ Accept: application/json
 
 GET {{BaseUrl}}/api/products
 Accept: application/json
+
+###
+
+GET {{BaseUrl}}/api/products/archived
+Accept: application/json
+Authorization: Bearer {{AdminToken}}
+
+###
+
+PUT {{BaseUrl}}/api/products/sku-1000
+Content-Type: application/json
+Authorization: Bearer {{AdminToken}}
+
+{
+	"name": "Starter Product Updated",
+	"price": 29.99,
+	"stock": 18
+}
+
+###
+
+PUT {{BaseUrl}}/api/products/sku-1000/archive
+Authorization: Bearer {{AdminToken}}
+
+###
+
+PUT {{BaseUrl}}/api/products/sku-1000/restore
+Authorization: Bearer {{AdminToken}}
+
+###
+
+DELETE {{BaseUrl}}/api/products/sku-1000
+Authorization: Bearer {{AdminToken}}
 
 ###

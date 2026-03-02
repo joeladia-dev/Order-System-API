@@ -3,11 +3,14 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Shared.Contracts;
+using System.Net;
+using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
 var authOptions = builder.Configuration.GetSection("Auth").Get<AuthOptions>() ?? new AuthOptions();
+var productServiceOptions = builder.Configuration.GetSection("ProductService").Get<ProductServiceOptions>() ?? new ProductServiceOptions();
 
 if (authOptions.Enabled && string.IsNullOrWhiteSpace(authOptions.SigningKey))
 {
@@ -15,6 +18,7 @@ if (authOptions.Enabled && string.IsNullOrWhiteSpace(authOptions.SigningKey))
 }
 
 builder.Services.AddOpenApi();
+builder.Services.AddHttpClient();
 builder.Services.AddDbContext<OrderDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("OrderDb") ?? "Data Source=orders.db"));
 
@@ -60,6 +64,21 @@ if (authOptions.Enabled)
                 IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(authOptions.SigningKey)),
                 ClockSkew = TimeSpan.FromSeconds(30)
             };
+
+            options.Events = new JwtBearerEvents
+            {
+                OnMessageReceived = context =>
+                {
+                    if (string.IsNullOrWhiteSpace(context.Token) &&
+                        context.Request.Cookies.TryGetValue(authOptions.CookieName, out var cookieToken) &&
+                        !string.IsNullOrWhiteSpace(cookieToken))
+                    {
+                        context.Token = cookieToken;
+                    }
+
+                    return Task.CompletedTask;
+                }
+            };
         });
 
     builder.Services.AddAuthorization(options =>
@@ -95,11 +114,55 @@ var createOrderEndpoint = app.MapPost("/api/orders", async (
     CreateOrderRequest request,
     HttpContext httpContext,
     OrderDbContext db,
-    IPublishEndpoint publishEndpoint) =>
+    IPublishEndpoint publishEndpoint,
+    IHttpClientFactory httpClientFactory) =>
 {
+    if (string.IsNullOrWhiteSpace(request.CustomerId) ||
+        string.IsNullOrWhiteSpace(request.ShippingAddress) ||
+        string.IsNullOrWhiteSpace(request.PaymentMethod))
+    {
+        return Results.BadRequest("CustomerId, ShippingAddress, and PaymentMethod are required.");
+    }
+
     if (request.Items.Count == 0)
     {
         return Results.BadRequest("Order requires at least one item.");
+    }
+
+    if (request.Items.Any(item => string.IsNullOrWhiteSpace(item.ProductId) || item.Quantity < 1))
+    {
+        return Results.BadRequest("Each order item must include ProductId and quantity of at least 1.");
+    }
+
+    var normalizedItems = request.Items
+        .GroupBy(item => item.ProductId.Trim(), StringComparer.OrdinalIgnoreCase)
+        .Select(group => new CreateOrderItemRequest(group.Key, group.Sum(item => item.Quantity)))
+        .ToList();
+
+    foreach (var item in normalizedItems)
+    {
+        var lookup = await TryGetProductAsync(httpClientFactory, productServiceOptions.BaseUrl, item.ProductId, httpContext.RequestAborted);
+
+        if (!lookup.Success)
+        {
+            if (lookup.StatusCode == HttpStatusCode.NotFound)
+            {
+                return Results.BadRequest($"Product '{item.ProductId}' does not exist.");
+            }
+
+            return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+        }
+
+        if (lookup.Product?.IsArchived == true)
+        {
+            return Results.BadRequest($"Product '{item.ProductId}' is archived and cannot be ordered.");
+        }
+
+        var availableStock = lookup.Product?.Stock ?? 0;
+        if (availableStock < item.Quantity)
+        {
+            return Results.BadRequest($"Insufficient stock for product '{item.ProductId}'. Available: {availableStock}, requested: {item.Quantity}.");
+        }
     }
 
     var order = new OrderEntity
@@ -111,7 +174,7 @@ var createOrderEndpoint = app.MapPost("/api/orders", async (
         Status = OrderStatus.Pending,
         CreatedAt = DateTimeOffset.UtcNow,
         UpdatedAt = DateTimeOffset.UtcNow,
-        Items = request.Items.Select(item => new OrderItemEntity
+        Items = normalizedItems.Select(item => new OrderItemEntity
         {
             Id = Guid.NewGuid(),
             ProductId = item.ProductId,
@@ -125,13 +188,26 @@ var createOrderEndpoint = app.MapPost("/api/orders", async (
     var correlationId = GetOrCreateCorrelationId(httpContext);
     var metadata = CreateMetadata(nameof(OrderCreated), correlationId);
 
-    await publishEndpoint.Publish(new OrderCreated(
-        metadata,
-        order.Id,
-        order.CustomerId,
-        order.ShippingAddress,
-        order.Items.Select(i => new OrderItem(i.ProductId, i.Quantity)).ToList(),
-        order.PaymentMethod));
+    try
+    {
+        using var publishTimeout = CancellationTokenSource.CreateLinkedTokenSource(httpContext.RequestAborted);
+        publishTimeout.CancelAfter(TimeSpan.FromSeconds(8));
+
+        await publishEndpoint.Publish(new OrderCreated(
+            metadata,
+            order.Id,
+            order.CustomerId,
+            order.ShippingAddress,
+            order.Items.Select(i => new OrderItem(i.ProductId, i.Quantity)).ToList(),
+            order.PaymentMethod), publishTimeout.Token);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex,
+            "Failed to publish OrderCreated event for order {OrderId}.", order.Id);
+
+        return Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+    }
 
     return Results.Created($"/api/orders/{order.Id}", new { orderId = order.Id, order.Status, correlationId });
 });
@@ -232,6 +308,55 @@ static Guid GetOrCreateCorrelationId(HttpContext httpContext)
     }
 
     return Guid.NewGuid();
+}
+
+static async Task<ProductLookupResult> TryGetProductAsync(
+    IHttpClientFactory httpClientFactory,
+    string baseUrl,
+    string productId,
+    CancellationToken cancellationToken)
+{
+    if (string.IsNullOrWhiteSpace(baseUrl))
+    {
+        return new ProductLookupResult { Success = false };
+    }
+
+    try
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        cts.CancelAfter(TimeSpan.FromSeconds(5));
+
+        var client = httpClientFactory.CreateClient();
+        var safeBaseUrl = baseUrl.TrimEnd('/');
+        var response = await client.GetAsync($"{safeBaseUrl}/api/products/{Uri.EscapeDataString(productId)}", cts.Token);
+
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return new ProductLookupResult { Success = false, StatusCode = HttpStatusCode.NotFound };
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            return new ProductLookupResult { Success = false, StatusCode = response.StatusCode };
+        }
+
+        var product = await response.Content.ReadFromJsonAsync<ProductLookupResponse>(cancellationToken: cts.Token);
+        if (product is null || string.IsNullOrWhiteSpace(product.Id))
+        {
+            return new ProductLookupResult { Success = false };
+        }
+
+        return new ProductLookupResult
+        {
+            Success = true,
+            StatusCode = response.StatusCode,
+            Product = product
+        };
+    }
+    catch
+    {
+        return new ProductLookupResult { Success = false };
+    }
 }
 
 sealed class InventoryReservedConsumer(OrderDbContext db) : IConsumer<InventoryReserved>
@@ -373,10 +498,30 @@ sealed record CreateOrderItemRequest(string ProductId, int Quantity);
 sealed record CancelOrderRequest(string? Reason);
 sealed record UpdateOrderStatusRequest(OrderStatus Status);
 
+sealed class ProductServiceOptions
+{
+    public string BaseUrl { get; set; } = "http://localhost:8082";
+}
+
+sealed class ProductLookupResponse
+{
+    public string Id { get; set; } = string.Empty;
+    public int Stock { get; set; }
+    public bool IsArchived { get; set; }
+}
+
+sealed class ProductLookupResult
+{
+    public bool Success { get; init; }
+    public HttpStatusCode? StatusCode { get; init; }
+    public ProductLookupResponse? Product { get; init; }
+}
+
 sealed class AuthOptions
 {
     public bool Enabled { get; set; }
     public string Issuer { get; set; } = "OrderSystem.Auth";
     public string Audience { get; set; } = "OrderSystem.Api";
+    public string CookieName { get; set; } = "order_system_auth";
     public string SigningKey { get; set; } = string.Empty;
 }
