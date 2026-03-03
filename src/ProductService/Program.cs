@@ -63,6 +63,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<ProductDbContext>();
     db.Database.EnsureCreated();
     EnsureProductSchema(db);
+    SeedProductsIfEmpty(db);
 }
 
 if (app.Environment.IsDevelopment())
@@ -267,6 +268,50 @@ static void EnsureProductSchema(ProductDbContext db)
     {
         db.Database.ExecuteSqlRaw("ALTER TABLE Products ADD COLUMN ArchivedAtUtc TEXT NULL;");
     }
+}
+
+static void SeedProductsIfEmpty(ProductDbContext db)
+{
+    var defaultProducts = new[]
+    {
+        new ProductEntity { Id = "sku-1000", Name = "Starter Product", Price = 25m, Stock = 12 },
+        new ProductEntity { Id = "sku-1001", Name = "Wireless Mouse", Price = 29.99m, Stock = 50 },
+        new ProductEntity { Id = "sku-1002", Name = "Mechanical Keyboard", Price = 89.99m, Stock = 35 },
+        new ProductEntity { Id = "sku-1003", Name = "27-inch Monitor", Price = 219.99m, Stock = 18 },
+        new ProductEntity { Id = "sku-1004", Name = "USB-C Hub", Price = 39.99m, Stock = 42 },
+        new ProductEntity { Id = "sku-1005", Name = "Laptop Stand", Price = 34.50m, Stock = 40 },
+        new ProductEntity { Id = "sku-1006", Name = "Noise-Canceling Headphones", Price = 149.00m, Stock = 22 },
+        new ProductEntity { Id = "sku-1007", Name = "Webcam 1080p", Price = 59.00m, Stock = 30 },
+        new ProductEntity { Id = "sku-1008", Name = "Portable SSD 1TB", Price = 119.99m, Stock = 26 },
+        new ProductEntity { Id = "sku-1009", Name = "Wireless Charger", Price = 24.99m, Stock = 60 },
+        new ProductEntity { Id = "sku-1010", Name = "Bluetooth Speaker", Price = 79.99m, Stock = 28 },
+        new ProductEntity { Id = "sku-1011", Name = "Ergonomic Chair", Price = 249.00m, Stock = 10 },
+        new ProductEntity { Id = "sku-1012", Name = "Desk Lamp", Price = 32.00m, Stock = 33 },
+        new ProductEntity { Id = "sku-1013", Name = "Smart Plug", Price = 19.99m, Stock = 75 },
+        new ProductEntity { Id = "sku-1014", Name = "Router AX3000", Price = 129.99m, Stock = 14 },
+        new ProductEntity { Id = "sku-1015", Name = "Power Bank 20000mAh", Price = 44.99m, Stock = 38 },
+        new ProductEntity { Id = "sku-1016", Name = "Phone Tripod", Price = 21.50m, Stock = 47 },
+        new ProductEntity { Id = "sku-1017", Name = "Graphics Tablet", Price = 69.99m, Stock = 19 },
+        new ProductEntity { Id = "sku-1018", Name = "Microphone USB", Price = 89.50m, Stock = 16 },
+        new ProductEntity { Id = "sku-1019", Name = "Cable Organizer Kit", Price = 14.99m, Stock = 80 }
+    };
+
+    var existingIds = db.Products
+        .Select(product => product.Id)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    var missingDefaults = defaultProducts
+        .Where(product => !existingIds.Contains(product.Id))
+        .ToList();
+
+    if (missingDefaults.Count == 0)
+    {
+        return;
+    }
+
+    db.Products.AddRange(missingDefaults);
+
+    db.SaveChanges();
 }
 
 sealed class ProductDbContext(DbContextOptions<ProductDbContext> options) : DbContext(options)
