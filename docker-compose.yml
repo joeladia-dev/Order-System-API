@@ -62,7 +62,7 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Development
       ConnectionStrings__ProductDb: Data Source=/data/products.db
-      Auth__Enabled: ${PRODUCT_AUTH_ENABLED:-true}
+      Auth__Enabled: true
       Auth__Issuer: ${AUTH_ISSUER:-OrderSystem.Auth}
       Auth__Audience: ${AUTH_AUDIENCE:-OrderSystem.Api}
       Auth__SigningKey: ${ORDER_SYSTEM_JWT_SIGNING_KEY}

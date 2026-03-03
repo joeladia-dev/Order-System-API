@@ -96,6 +96,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<OrderDbContext>();
     db.Database.EnsureCreated();
     EnsureOrderSchema(db);
+    BackfillOrderCustomerSubjects(db, app.Logger);
 }
 
 if (app.Environment.IsDevelopment())
@@ -118,11 +119,58 @@ var createOrderEndpoint = app.MapPost("/api/orders", async (
     IPublishEndpoint publishEndpoint,
     IHttpClientFactory httpClientFactory) =>
 {
-    if (string.IsNullOrWhiteSpace(request.CustomerId) ||
-        string.IsNullOrWhiteSpace(request.ShippingAddress) ||
+    if (string.IsNullOrWhiteSpace(request.ShippingAddress) ||
         string.IsNullOrWhiteSpace(request.PaymentMethod))
     {
-        return Results.BadRequest("CustomerId, ShippingAddress, and PaymentMethod are required.");
+        return Results.BadRequest("ShippingAddress and PaymentMethod are required.");
+    }
+
+    var isAdmin = IsInRole(httpContext.User, "admin");
+    var isCustomer = IsInRole(httpContext.User, "customer");
+    var subjectId = GetUserSubjectId(httpContext.User);
+
+    string resolvedCustomerId;
+    string? resolvedCustomerSubjectId;
+
+    if (authOptions.Enabled)
+    {
+        if (isAdmin)
+        {
+            if (string.IsNullOrWhiteSpace(request.CustomerId))
+            {
+                return Results.BadRequest("CustomerId is required when creating orders as admin.");
+            }
+
+            resolvedCustomerId = request.CustomerId.Trim();
+            resolvedCustomerSubjectId = !string.IsNullOrWhiteSpace(subjectId) &&
+                                        string.Equals(resolvedCustomerId, subjectId, StringComparison.Ordinal)
+                ? subjectId
+                : null;
+        }
+        else if (isCustomer)
+        {
+            if (string.IsNullOrWhiteSpace(subjectId))
+            {
+                return Results.Unauthorized();
+            }
+
+            resolvedCustomerId = subjectId;
+            resolvedCustomerSubjectId = subjectId;
+        }
+        else
+        {
+            return Results.Forbid();
+        }
+    }
+    else
+    {
+        if (string.IsNullOrWhiteSpace(request.CustomerId))
+        {
+            return Results.BadRequest("CustomerId is required.");
+        }
+
+        resolvedCustomerId = request.CustomerId.Trim();
+        resolvedCustomerSubjectId = null;
     }
 
     if (request.Items.Count == 0)
@@ -169,7 +217,8 @@ var createOrderEndpoint = app.MapPost("/api/orders", async (
     var order = new OrderEntity
     {
         Id = Guid.NewGuid(),
-        CustomerId = request.CustomerId,
+        CustomerId = resolvedCustomerId,
+        CustomerSubjectId = resolvedCustomerSubjectId,
         ShippingAddress = request.ShippingAddress,
         PaymentMethod = request.PaymentMethod,
         Status = OrderStatus.Pending,
@@ -218,21 +267,88 @@ if (authOptions.Enabled)
     createOrderEndpoint.RequireAuthorization("CustomerOrAdmin");
 }
 
-var getOrderEndpoint = app.MapGet("/api/orders/{orderId:guid}", async (Guid orderId, OrderDbContext db) =>
+var getOrderEndpoint = app.MapGet("/api/orders/{orderId:guid}", async (Guid orderId, HttpContext httpContext, OrderDbContext db) =>
 {
     var order = await db.Orders.Include(x => x.Items).FirstOrDefaultAsync(x => x.Id == orderId);
-    return order is null ? Results.NotFound() : Results.Ok(order.ToResponse());
+    if (order is null)
+    {
+        return Results.NotFound();
+    }
+
+    if (authOptions.Enabled)
+    {
+        var isAdmin = IsInRole(httpContext.User, "admin");
+        var isCustomer = IsInRole(httpContext.User, "customer");
+
+        if (!isAdmin)
+        {
+            if (!isCustomer)
+            {
+                return Results.Forbid();
+            }
+
+            var subjectId = GetUserSubjectId(httpContext.User);
+            if (string.IsNullOrWhiteSpace(subjectId) ||
+                !string.Equals(order.CustomerSubjectId, subjectId, StringComparison.Ordinal))
+            {
+                return Results.NotFound();
+            }
+        }
+    }
+
+    return Results.Ok(order.ToResponse());
 });
 if (authOptions.Enabled)
 {
     getOrderEndpoint.RequireAuthorization("CustomerOrAdmin");
 }
 
-var getOrdersForCustomerEndpoint = app.MapGet("/api/orders/customer/{customerId}", async (string customerId, OrderDbContext db) =>
+var getOrdersForCustomerEndpoint = app.MapGet("/api/orders/customer/{customerId}", async (string customerId, HttpContext httpContext, OrderDbContext db) =>
 {
-    var orders = await db.Orders
-        .Include(x => x.Items)
-        .Where(x => x.CustomerId == customerId)
+    IQueryable<OrderEntity> query = db.Orders.Include(x => x.Items);
+
+    if (authOptions.Enabled)
+    {
+        var isAdmin = IsInRole(httpContext.User, "admin");
+        var isCustomer = IsInRole(httpContext.User, "customer");
+
+        if (isAdmin)
+        {
+            var normalizedCustomerId = customerId.Trim();
+            if (string.IsNullOrWhiteSpace(normalizedCustomerId))
+            {
+                return Results.BadRequest("CustomerId is required.");
+            }
+
+            query = query.Where(x => x.CustomerId == normalizedCustomerId);
+        }
+        else if (isCustomer)
+        {
+            var subjectId = GetUserSubjectId(httpContext.User);
+            if (string.IsNullOrWhiteSpace(subjectId))
+            {
+                return Results.Unauthorized();
+            }
+
+            query = query.Where(x => x.CustomerSubjectId == subjectId);
+        }
+        else
+        {
+            return Results.Forbid();
+        }
+    }
+    else
+    {
+        var normalizedCustomerId = customerId.Trim();
+        if (string.IsNullOrWhiteSpace(normalizedCustomerId))
+        {
+            return Results.BadRequest("CustomerId is required.");
+        }
+
+        query = query.Where(x => x.CustomerId == normalizedCustomerId);
+    }
+
+    var orders = await query
         .ToListAsync();
 
     var ordered = orders
@@ -258,6 +374,27 @@ var cancelOrderEndpoint = app.MapPost("/api/orders/{orderId:guid}/cancel", async
     if (order is null)
     {
         return Results.NotFound();
+    }
+
+    if (authOptions.Enabled)
+    {
+        var isAdmin = IsInRole(httpContext.User, "admin");
+        var isCustomer = IsInRole(httpContext.User, "customer");
+
+        if (!isAdmin)
+        {
+            if (!isCustomer)
+            {
+                return Results.Forbid();
+            }
+
+            var subjectId = GetUserSubjectId(httpContext.User);
+            if (string.IsNullOrWhiteSpace(subjectId) ||
+                !string.Equals(order.CustomerSubjectId, subjectId, StringComparison.Ordinal))
+            {
+                return Results.NotFound();
+            }
+        }
     }
 
     if (order.Status is OrderStatus.Shipped or OrderStatus.Delivered)
@@ -315,6 +452,15 @@ static Guid GetOrCreateCorrelationId(HttpContext httpContext)
     return Guid.NewGuid();
 }
 
+static string? GetUserSubjectId(ClaimsPrincipal user) =>
+    user.FindFirstValue("sub") ??
+    user.FindFirstValue(ClaimTypes.NameIdentifier);
+
+static bool IsInRole(ClaimsPrincipal user, string role) =>
+    user.Claims.Any(claim =>
+        string.Equals(claim.Type, ClaimTypes.Role, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(claim.Value, role, StringComparison.OrdinalIgnoreCase));
+
 static void EnsureOrderSchema(OrderDbContext db)
 {
     var columns = db.Database
@@ -325,6 +471,46 @@ static void EnsureOrderSchema(OrderDbContext db)
     {
         db.Database.ExecuteSqlRaw("ALTER TABLE Orders ADD COLUMN FailureReason TEXT NULL;");
     }
+
+    if (!columns.Contains("CustomerSubjectId"))
+    {
+        db.Database.ExecuteSqlRaw("ALTER TABLE Orders ADD COLUMN CustomerSubjectId TEXT NULL;");
+    }
+}
+
+static void BackfillOrderCustomerSubjects(OrderDbContext db, ILogger logger)
+{
+    var legacyOrders = db.Orders
+        .Where(order => order.CustomerSubjectId == null)
+        .ToList();
+
+    var skipped = 0;
+    var backfilled = 0;
+    var updated = false;
+    foreach (var order in legacyOrders)
+    {
+        if (Guid.TryParse(order.CustomerId, out _))
+        {
+            order.CustomerSubjectId = order.CustomerId;
+            updated = true;
+            backfilled++;
+        }
+        else
+        {
+            skipped++;
+        }
+    }
+
+    if (updated)
+    {
+        db.SaveChanges();
+    }
+
+    logger.LogInformation(
+        "Order ownership backfill complete. Backfilled={BackfilledCount}, SkippedLegacy={SkippedCount}, TotalUnmappedBefore={TotalCount}",
+        backfilled,
+        skipped,
+        legacyOrders.Count);
 }
 
 static async Task<ProductLookupResult> TryGetProductAsync(
@@ -483,6 +669,7 @@ sealed class OrderEntity
 {
     public Guid Id { get; set; }
     public string CustomerId { get; set; } = string.Empty;
+    public string? CustomerSubjectId { get; set; }
     public string ShippingAddress { get; set; } = string.Empty;
     public string PaymentMethod { get; set; } = string.Empty;
     public OrderStatus Status { get; set; }

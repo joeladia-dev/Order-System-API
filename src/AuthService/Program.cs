@@ -135,6 +135,23 @@ app.MapGet("/api/auth/session", (HttpContext httpContext) =>
     });
 });
 
+app.MapPost("/api/auth/logout", (HttpContext httpContext) =>
+{
+    var secureCookie = httpContext.Request.IsHttps || !app.Environment.IsDevelopment();
+    httpContext.Response.Cookies.Delete(authOptions.CookieName, new CookieOptions
+    {
+        HttpOnly = true,
+        Secure = secureCookie,
+        SameSite = SameSiteMode.Lax,
+        Path = "/"
+    });
+
+    return Results.Ok(new
+    {
+        signedOut = true
+    });
+});
+
 app.MapPost("/api/auth/request-code", async (RequestCodeRequest request, AuthDbContext db, IWebHostEnvironment env) =>
 {
     var normalizedEmail = NormalizeEmail(request.Email);
