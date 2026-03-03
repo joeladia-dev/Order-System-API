@@ -9,7 +9,8 @@ public enum OrderStatus
     PaymentFailed,
     Shipped,
     Delivered,
-    Cancelled
+    Cancelled,
+    InventoryFailed
 }
 
 public sealed record EventMetadata(

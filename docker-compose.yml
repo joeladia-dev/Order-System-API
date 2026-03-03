@@ -127,6 +127,7 @@ services:
       RabbitMq__Host: rabbitmq
       RabbitMq__Username: guest
       RabbitMq__Password: guest
+      Shipping__AutoDeliverDelaySeconds: ${SHIPPING_AUTO_DELIVER_DELAY_SECONDS:-10}
       ConnectionStrings__ShippingDb: Data Source=/data/shipping.db
       Auth__Enabled: ${SHIPPING_AUTH_ENABLED:-false}
       Auth__Issuer: ${AUTH_ISSUER:-OrderSystem.Auth}

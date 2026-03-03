@@ -71,6 +71,7 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<PaymentDbContext>();
     db.Database.EnsureCreated();
+    EnsurePaymentSchema(db);
 }
 
 if (app.Environment.IsDevelopment())
@@ -98,12 +99,14 @@ var processPaymentEndpoint = app.MapPost("/api/payments/process", async (Process
             Amount = request.Amount,
             Status = PaymentState.Processing,
             TransactionId = Guid.NewGuid().ToString("N"),
+            FailureReason = null,
             UpdatedAt = DateTimeOffset.UtcNow
         };
         db.Payments.Add(payment);
     }
 
     payment.Status = request.Success ? PaymentState.Completed : PaymentState.Failed;
+    payment.FailureReason = request.Success ? null : "Payment was declined";
     payment.UpdatedAt = DateTimeOffset.UtcNow;
     await db.SaveChangesAsync();
 
@@ -151,6 +154,18 @@ bool HasScope(ClaimsPrincipal user, string scope)
     return false;
 }
 
+static void EnsurePaymentSchema(PaymentDbContext db)
+{
+    var columns = db.Database
+        .SqlQueryRaw<string>("SELECT name FROM pragma_table_info('Payments');")
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    if (!columns.Contains("FailureReason"))
+    {
+        db.Database.ExecuteSqlRaw("ALTER TABLE Payments ADD COLUMN FailureReason TEXT NULL;");
+    }
+}
+
 app.Run();
 
 sealed class InventoryReservedConsumer(PaymentDbContext db, IPublishEndpoint publishEndpoint) : IConsumer<InventoryReserved>
@@ -169,12 +184,14 @@ sealed class InventoryReservedConsumer(PaymentDbContext db, IPublishEndpoint pub
                 Amount = amount,
                 Status = PaymentState.Processing,
                 TransactionId = Guid.NewGuid().ToString("N"),
+                FailureReason = null,
                 UpdatedAt = DateTimeOffset.UtcNow
             };
             db.Payments.Add(payment);
         }
 
         payment.Status = PaymentState.Completed;
+        payment.FailureReason = null;
         payment.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(context.CancellationToken);
 
@@ -200,6 +217,7 @@ sealed class InventoryFailedConsumer(PaymentDbContext db, IPublishEndpoint publi
                 Amount = 0,
                 Status = PaymentState.Failed,
                 TransactionId = Guid.NewGuid().ToString("N"),
+                FailureReason = context.Message.Reason,
                 UpdatedAt = DateTimeOffset.UtcNow
             };
             db.Payments.Add(payment);
@@ -207,6 +225,7 @@ sealed class InventoryFailedConsumer(PaymentDbContext db, IPublishEndpoint publi
         else
         {
             payment.Status = PaymentState.Failed;
+            payment.FailureReason = context.Message.Reason;
             payment.UpdatedAt = DateTimeOffset.UtcNow;
         }
 
@@ -242,6 +261,7 @@ sealed class PaymentEntity
     public decimal Amount { get; set; }
     public string TransactionId { get; set; } = string.Empty;
     public PaymentState Status { get; set; }
+    public string? FailureReason { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }
 

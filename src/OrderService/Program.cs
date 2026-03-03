@@ -95,6 +95,7 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<OrderDbContext>();
     db.Database.EnsureCreated();
+    EnsureOrderSchema(db);
 }
 
 if (app.Environment.IsDevelopment())
@@ -172,6 +173,7 @@ var createOrderEndpoint = app.MapPost("/api/orders", async (
         ShippingAddress = request.ShippingAddress,
         PaymentMethod = request.PaymentMethod,
         Status = OrderStatus.Pending,
+        FailureReason = null,
         CreatedAt = DateTimeOffset.UtcNow,
         UpdatedAt = DateTimeOffset.UtcNow,
         Items = normalizedItems.Select(item => new OrderItemEntity
@@ -231,11 +233,14 @@ var getOrdersForCustomerEndpoint = app.MapGet("/api/orders/customer/{customerId}
     var orders = await db.Orders
         .Include(x => x.Items)
         .Where(x => x.CustomerId == customerId)
-        .OrderByDescending(x => x.CreatedAt)
-        .Select(x => x.ToResponse())
         .ToListAsync();
 
-    return Results.Ok(orders);
+    var ordered = orders
+        .OrderByDescending(x => x.CreatedAt)
+        .Select(x => x.ToResponse())
+        .ToList();
+
+    return Results.Ok(ordered);
 });
 if (authOptions.Enabled)
 {
@@ -310,6 +315,18 @@ static Guid GetOrCreateCorrelationId(HttpContext httpContext)
     return Guid.NewGuid();
 }
 
+static void EnsureOrderSchema(OrderDbContext db)
+{
+    var columns = db.Database
+        .SqlQueryRaw<string>("SELECT name FROM pragma_table_info('Orders');")
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    if (!columns.Contains("FailureReason"))
+    {
+        db.Database.ExecuteSqlRaw("ALTER TABLE Orders ADD COLUMN FailureReason TEXT NULL;");
+    }
+}
+
 static async Task<ProductLookupResult> TryGetProductAsync(
     IHttpClientFactory httpClientFactory,
     string baseUrl,
@@ -367,6 +384,7 @@ sealed class InventoryReservedConsumer(OrderDbContext db) : IConsumer<InventoryR
         if (order is null) return;
 
         order.Status = OrderStatus.InventoryReserved;
+        order.FailureReason = null;
         order.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
     }
@@ -379,7 +397,8 @@ sealed class InventoryFailedConsumer(OrderDbContext db) : IConsumer<InventoryFai
         var order = await db.Orders.FindAsync(context.Message.OrderId);
         if (order is null) return;
 
-        order.Status = OrderStatus.PaymentFailed;
+        order.Status = OrderStatus.InventoryFailed;
+        order.FailureReason = context.Message.Reason;
         order.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
     }
@@ -393,6 +412,7 @@ sealed class PaymentCompletedConsumer(OrderDbContext db) : IConsumer<PaymentComp
         if (order is null) return;
 
         order.Status = OrderStatus.PaymentCompleted;
+        order.FailureReason = null;
         order.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
     }
@@ -406,6 +426,7 @@ sealed class PaymentFailedConsumer(OrderDbContext db) : IConsumer<PaymentFailed>
         if (order is null) return;
 
         order.Status = OrderStatus.PaymentFailed;
+        order.FailureReason = context.Message.Reason;
         order.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
     }
@@ -419,6 +440,7 @@ sealed class OrderShippedConsumer(OrderDbContext db) : IConsumer<OrderShipped>
         if (order is null) return;
 
         order.Status = OrderStatus.Shipped;
+        order.FailureReason = null;
         order.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
     }
@@ -432,6 +454,7 @@ sealed class OrderDeliveredConsumer(OrderDbContext db) : IConsumer<OrderDelivere
         if (order is null) return;
 
         order.Status = OrderStatus.Delivered;
+        order.FailureReason = null;
         order.UpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync();
     }
@@ -463,6 +486,7 @@ sealed class OrderEntity
     public string ShippingAddress { get; set; } = string.Empty;
     public string PaymentMethod { get; set; } = string.Empty;
     public OrderStatus Status { get; set; }
+    public string? FailureReason { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
     public List<OrderItemEntity> Items { get; set; } = [];
@@ -474,6 +498,7 @@ sealed class OrderEntity
         ShippingAddress,
         PaymentMethod,
         Status,
+        FailureReason,
         CreatedAt,
         UpdatedAt,
         Items = Items.Select(i => new { i.ProductId, i.Quantity })

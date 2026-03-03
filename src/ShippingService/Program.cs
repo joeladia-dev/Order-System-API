@@ -1,6 +1,7 @@
 using MassTransit;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
 using Shared.Contracts;
 using System.Security.Claims;
@@ -15,12 +16,14 @@ if (authOptions.Enabled && string.IsNullOrWhiteSpace(authOptions.SigningKey))
 }
 
 builder.Services.AddOpenApi();
+builder.Services.Configure<ShippingOptions>(builder.Configuration.GetSection("Shipping"));
 builder.Services.AddDbContext<ShippingDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("ShippingDb") ?? "Data Source=shipping.db"));
 
 builder.Services.AddMassTransit(configurator =>
 {
     configurator.AddConsumer<PaymentCompletedConsumer>();
+    configurator.AddConsumer<PaymentFailedConsumer>();
 
     configurator.UsingRabbitMq((context, cfg) =>
     {
@@ -70,6 +73,7 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<ShippingDbContext>();
     db.Database.EnsureCreated();
+    EnsureShippingSchema(db);
 }
 
 if (app.Environment.IsDevelopment())
@@ -85,7 +89,7 @@ if (authOptions.Enabled)
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", service = "ShippingService" }));
 
-var createShipmentEndpoint = app.MapPost("/api/shipping/create", async (CreateShipmentRequest request, ShippingDbContext db, IPublishEndpoint publishEndpoint) =>
+var createShipmentEndpoint = app.MapPost("/api/shipping/create", async (CreateShipmentRequest request, ShippingDbContext db) =>
 {
     var existing = await db.Shipments.FirstOrDefaultAsync(x => x.OrderId == request.OrderId);
     if (existing is not null)
@@ -98,21 +102,16 @@ var createShipmentEndpoint = app.MapPost("/api/shipping/create", async (CreateSh
         Id = Guid.NewGuid(),
         OrderId = request.OrderId,
         TrackingNumber = $"TRK-{Guid.NewGuid().ToString("N")[..10].ToUpperInvariant()}",
-        Status = ShipmentState.Shipped,
+        Status = ShipmentState.LabelCreated,
+        FailureReason = null,
         CreatedAt = DateTimeOffset.UtcNow,
+        LastUpdatedAt = DateTimeOffset.UtcNow,
         EstimatedDeliveryDate = DateTimeOffset.UtcNow.AddDays(3),
         DeliveredAt = null
     };
 
     db.Shipments.Add(shipment);
     await db.SaveChangesAsync();
-
-    var correlationId = request.CorrelationId ?? Guid.NewGuid();
-    await publishEndpoint.Publish(new OrderShipped(
-        new EventMetadata(Guid.NewGuid(), correlationId, nameof(OrderShipped), DateTimeOffset.UtcNow),
-        shipment.OrderId,
-        shipment.TrackingNumber,
-        shipment.EstimatedDeliveryDate));
 
     return Results.Ok(shipment);
 });
@@ -146,9 +145,30 @@ bool HasScope(ClaimsPrincipal user, string scope)
     return false;
 }
 
+static void EnsureShippingSchema(ShippingDbContext db)
+{
+    var columns = db.Database
+        .SqlQueryRaw<string>("SELECT name FROM pragma_table_info('Shipments');")
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    if (!columns.Contains("FailureReason"))
+    {
+        db.Database.ExecuteSqlRaw("ALTER TABLE Shipments ADD COLUMN FailureReason TEXT NULL;");
+    }
+
+    if (!columns.Contains("LastUpdatedAt"))
+    {
+        db.Database.ExecuteSqlRaw("ALTER TABLE Shipments ADD COLUMN LastUpdatedAt TEXT NOT NULL DEFAULT '0001-01-01T00:00:00+00:00';");
+        db.Database.ExecuteSqlRaw("UPDATE Shipments SET LastUpdatedAt = CreatedAt WHERE LastUpdatedAt = '0001-01-01T00:00:00+00:00';");
+    }
+}
+
 app.Run();
 
-sealed class PaymentCompletedConsumer(ShippingDbContext db, IPublishEndpoint publishEndpoint) : IConsumer<PaymentCompleted>
+sealed class PaymentCompletedConsumer(
+    ShippingDbContext db,
+    IPublishEndpoint publishEndpoint,
+    IOptions<ShippingOptions> shippingOptions) : IConsumer<PaymentCompleted>
 {
     public async Task Consume(ConsumeContext<PaymentCompleted> context)
     {
@@ -160,8 +180,10 @@ sealed class PaymentCompletedConsumer(ShippingDbContext db, IPublishEndpoint pub
                 Id = Guid.NewGuid(),
                 OrderId = context.Message.OrderId,
                 TrackingNumber = $"TRK-{Guid.NewGuid().ToString("N")[..10].ToUpperInvariant()}",
-                Status = ShipmentState.Shipped,
+                Status = ShipmentState.LabelCreated,
+                FailureReason = null,
                 CreatedAt = DateTimeOffset.UtcNow,
+                LastUpdatedAt = DateTimeOffset.UtcNow,
                 EstimatedDeliveryDate = DateTimeOffset.UtcNow.AddDays(3),
                 DeliveredAt = null
             };
@@ -169,6 +191,8 @@ sealed class PaymentCompletedConsumer(ShippingDbContext db, IPublishEndpoint pub
         }
 
         shipment.Status = ShipmentState.Shipped;
+        shipment.FailureReason = null;
+        shipment.LastUpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(context.CancellationToken);
 
         var shippedMetadata = new EventMetadata(Guid.NewGuid(), context.Message.Metadata.CorrelationId, nameof(OrderShipped), DateTimeOffset.UtcNow);
@@ -178,12 +202,33 @@ sealed class PaymentCompletedConsumer(ShippingDbContext db, IPublishEndpoint pub
             shipment.TrackingNumber,
             shipment.EstimatedDeliveryDate), context.CancellationToken);
 
+        var delaySeconds = Math.Clamp(shippingOptions.Value.AutoDeliverDelaySeconds, 1, 30);
+        await Task.Delay(TimeSpan.FromSeconds(delaySeconds), context.CancellationToken);
+
         shipment.Status = ShipmentState.Delivered;
         shipment.DeliveredAt = DateTimeOffset.UtcNow;
+        shipment.LastUpdatedAt = DateTimeOffset.UtcNow;
         await db.SaveChangesAsync(context.CancellationToken);
 
         var deliveredMetadata = new EventMetadata(Guid.NewGuid(), context.Message.Metadata.CorrelationId, nameof(OrderDelivered), DateTimeOffset.UtcNow);
         await publishEndpoint.Publish(new OrderDelivered(deliveredMetadata, shipment.OrderId, shipment.DeliveredAt.Value), context.CancellationToken);
+    }
+}
+
+sealed class PaymentFailedConsumer(ShippingDbContext db) : IConsumer<PaymentFailed>
+{
+    public async Task Consume(ConsumeContext<PaymentFailed> context)
+    {
+        var shipment = await db.Shipments.FirstOrDefaultAsync(x => x.OrderId == context.Message.OrderId, context.CancellationToken);
+        if (shipment is null)
+        {
+            return;
+        }
+
+        shipment.Status = ShipmentState.Failed;
+        shipment.FailureReason = context.Message.Reason;
+        shipment.LastUpdatedAt = DateTimeOffset.UtcNow;
+        await db.SaveChangesAsync(context.CancellationToken);
     }
 }
 
@@ -209,18 +254,27 @@ sealed class ShipmentEntity
     public Guid OrderId { get; set; }
     public string TrackingNumber { get; set; } = string.Empty;
     public ShipmentState Status { get; set; }
+    public string? FailureReason { get; set; }
     public DateTimeOffset CreatedAt { get; set; }
+    public DateTimeOffset LastUpdatedAt { get; set; }
     public DateTimeOffset EstimatedDeliveryDate { get; set; }
     public DateTimeOffset? DeliveredAt { get; set; }
 }
 
 enum ShipmentState
 {
+    LabelCreated,
     Shipped,
-    Delivered
+    Delivered,
+    Failed
 }
 
 sealed record CreateShipmentRequest(Guid OrderId, Guid? CorrelationId);
+
+sealed class ShippingOptions
+{
+    public int AutoDeliverDelaySeconds { get; set; } = 2;
+}
 
 sealed class AuthOptions
 {
